@@ -1,22 +1,33 @@
-mod data;
-use data::{Expr, Op};
+use xymbolic::{
+    index::Index,
+    op::{fannx, fcrex},
+    wick::WickTheorem,
+};
 
-mod wick;
-use wick::WickTheorem;
-
+#[allow(unused_variables)]
 fn main() {
-    let ap3 = Op::fannx("p3".to_string());
-    let ap4 = Op::fannx("p4".to_string());
-    let cp1 = Op::fcrex("p1".to_string());
-    let cp2 = Op::fcrex("p2".to_string());
+    let p1 = Index::new("p_1").build().unwrap();
+    let p2 = Index::new("p_2").build().unwrap();
+    let p3 = Index::new("p_3").build().unwrap();
+    let p4 = Index::new("p_4").build().unwrap();
 
-    let expr: Expr = vec![ap3, ap4, cp1, cp2].into();
-    println!("{}", expr);
+    let cp1 = fcrex(p1);
+    let cp2 = fcrex(p2);
+    let ap3 = fannx(p3);
+    let ap4 = fannx(p4);
+    let expr = 1.0 * ap3 * ap4 * cp1 * cp2;
+    println!("{}", expr.to_latex());
 
-    let wt = WickTheorem::new(expr)
+    let fc = WickTheorem::new(expr.clone())
         .full_contractions(true)
         .compute()
-        .to_string();
+        .to_latex();
 
-    println!("{}", wt);
+    println!("{}", fc);
+
+    let ufc = WickTheorem::new(expr)
+        .full_contractions(false)
+        .compute()
+        .to_latex();
+    println!("{}", ufc);
 }

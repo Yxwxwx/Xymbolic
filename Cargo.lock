@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "wick"
+name = "xymbolic"
 version = "0.1.0"

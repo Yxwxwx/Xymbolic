@@ -1,24 +1,38 @@
-// src/wick.rs
+/// src/wick.rs
+use crate::attr::{Action, Statistics, Vacuum};
+use crate::expr::{Expr, is_normal_order};
+use crate::index::Index;
+use crate::op::{Delta, Op, can_contract};
+use crate::result_expr::ResultExpr;
 
-use crate::data::{Delta, Expr, Op};
-
-// Type aliases similar to C++ using
+// Type aliases
 type IndexList = Vec<usize>;
 type Pairing = Vec<(usize, usize)>;
-type ExprSum = Vec<Expr>;
 
 pub struct WickTheorem {
     expr_: Expr,
     full_contractions_: bool,
-    wick_result_: ExprSum,
+    wick_result_: ResultExpr,
+    vacuum_: Vacuum,
+    statistics_: Statistics,
 }
 
 impl WickTheorem {
     pub fn new(expr: Expr) -> Self {
+        let vacuum = expr
+            .ops()
+            .first()
+            .map(|o| o.index.vacuum())
+            .unwrap_or(Vacuum::Physical);
+
+        let statistics = expr.statistic;
+
         Self {
             expr_: expr,
             full_contractions_: false,
-            wick_result_: ExprSum::new(),
+            wick_result_: ResultExpr::new(),
+            vacuum_: vacuum,
+            statistics_: statistics,
         }
     }
 
@@ -28,25 +42,18 @@ impl WickTheorem {
     }
 
     pub fn compute(&mut self) -> &mut Self {
-        if self.full_contractions_ {
-            self.wick_result_ = self.wick_expand_fc();
-        } else {
-            self.wick_result_ = self.wick_expand();
+        match (self.vacuum_, self.full_contractions_) {
+            (Vacuum::Physical, true) => self.wick_result_ = self.wick_expand_fc_pv(),
+            (Vacuum::Physical, false) => {
+                self.wick_result_ = self.wick_expand_pv(self.expr_.clone())
+            }
+            _ => {}
         }
         self
     }
 
-    pub fn to_string(&self) -> String {
-        if self.wick_result_.is_empty() {
-            return "0".to_string();
-        }
-        // Pretty print: join with " + " and handle sign
-        self.wick_result_
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join(" + ")
-            .replace("+ -", "- ") // Simple cosmetic fix
+    pub fn to_latex(&self) -> String {
+        self.wick_result_.to_latex()
     }
 }
 
@@ -54,18 +61,21 @@ impl WickTheorem {
 
 impl WickTheorem {
     /// Full Wick contraction logic
-    fn wick_expand_fc(&self) -> ExprSum {
-        if self.expr_.ops.len() <= 1 || is_normal_order(&self.expr_) {
-            return vec![self.expr_.clone()];
+    fn wick_expand_fc_pv(&self) -> ResultExpr {
+        if self.expr_.ops().len() <= 1 || is_normal_order(&self.expr_) {
+            return ResultExpr::from_expr(self.expr_.clone());
         }
 
-        let ops = &self.expr_.ops;
-        let num_create = ops.iter().filter(|o| matches!(o, Op::Create(_))).count();
+        let ops = &self.expr_.ops();
+        let num_create = ops
+            .iter()
+            .filter(|o| matches!(o.action(), Action::Create))
+            .count();
         let num_annihilate = ops.len() - num_create;
 
         // In full contraction, creation and annihilation counts must match
         if num_create != num_annihilate {
-            return vec![];
+            return ResultExpr::new();
         }
 
         let indices: IndexList = (0..ops.len()).collect();
@@ -75,28 +85,67 @@ impl WickTheorem {
             .into_iter()
             .map(|p| {
                 let c = count_crossings(&p);
-                let sign = if c % 2 == 0 { 1.0 } else { -1.0 };
 
-                let mut term = Expr::from(vec![]); // Result of FC has no ops
-                term.coeff = sign * self.expr_.coeff;
+                let sign = match self.statistics_ {
+                    Statistics::FermiDirac if c % 2 != 0 => -1.0,
+                    _ => 1.0,
+                };
+
+                let mut term = Expr::new(); // Result of FC has no ops
+                term = term.set_coeff(sign * self.expr_.coeff());
 
                 for (i, j) in p {
                     // Extract string indices from operators
                     let idx_i = get_op_index(&self.expr_.ops[i]);
                     let idx_j = get_op_index(&self.expr_.ops[j]);
-                    term.with_delta(Delta { i: idx_i, j: idx_j });
+                    term.add_delta(Delta { a: idx_i, b: idx_j });
                 }
                 term
             })
             .collect()
     }
 
-    fn wick_expand(&self) -> ExprSum {
-        // Placeholder for partial Wick contraction if needed
-        if self.expr_.ops.len() <= 1 {
-            return vec![self.expr_.clone()];
+    fn wick_expand_pv(&self, e: Expr) -> ResultExpr {
+        if e.ops.len() <= 1 || is_normal_order(&e) {
+            return ResultExpr::from_expr(e);
         }
-        vec![]
+
+        // 遍历寻找可以收缩/交换的相邻对
+        for i in 0..e.ops.len() - 1 {
+            let a = &e.ops[i];
+            let b = &e.ops[i + 1];
+
+            if can_contract(a, b) {
+                let mut results = ResultExpr::new();
+
+                // 1. 处理交换项 (Swapped Term)
+                let mut swapped = e.clone();
+                swapped.ops.swap(i, i + 1);
+
+                if self.statistics_ == Statistics::FermiDirac {
+                    swapped.coeff *= -1.0;
+                }
+
+                results = results + self.wick_expand_pv(swapped);
+
+                let mut contracted = e.clone();
+                contracted.add_delta(Delta {
+                    a: a.index.clone(),
+                    b: b.index.clone(),
+                });
+
+                if contracted.coeff.abs() > 1e-12 {
+                    contracted.ops.remove(i);
+                    contracted.ops.remove(i);
+
+                    results = results + self.wick_expand_pv(contracted);
+                }
+
+                return results;
+            }
+        }
+
+        ResultExpr::from_expr(e)
     }
 }
 
@@ -123,7 +172,7 @@ fn generate_pairings(e: &Expr, free_indices: &IndexList) -> Vec<Pairing> {
 
     // Contraction rule: In this specific implementation, we assume we are contracting
     // an Annihilator with a Creator to its right.
-    if matches!(a, Op::Create(_)) {
+    if matches!(a.action(), Action::Create) {
         return vec![];
     }
 
@@ -197,16 +246,55 @@ fn count_crossings(p: &Pairing) -> usize {
     }
     count
 }
-fn can_contract(a: &Op, b: &Op) -> bool {
-    matches!((a, b), (Op::Annihilate(_), Op::Create(_)))
+
+fn get_op_index(op: &Op) -> Index {
+    op.index.clone()
 }
 
-fn get_op_index(op: &Op) -> String {
-    match op {
-        Op::Create(s) | Op::Annihilate(s) => s.clone(),
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::op::{fannx, fcrex};
+    #[test]
+    fn fermion_full_contraction() {
+        let p1 = Index::new("p_1").build().unwrap();
+        let p2 = Index::new("p_2").build().unwrap();
+        let p3 = Index::new("p_3").build().unwrap();
+        let p4 = Index::new("p_4").build().unwrap();
+
+        let cp1 = fcrex(p1);
+        let cp2 = fcrex(p2);
+        let ap3 = fannx(p3);
+        let ap4 = fannx(p4);
+        let expr = 1.0 * ap3 * ap4 * cp1 * cp2;
+
+        let wt = WickTheorem::new(expr)
+            .full_contractions(true)
+            .compute()
+            .to_latex();
+        assert_eq!(wt, "-s^{p3}_{p1}s^{p4}_{p2} + s^{p3}_{p2}s^{p4}_{p1}");
     }
-}
 
-fn is_normal_order(expr: &Expr) -> bool {
-    expr.ops.windows(2).all(|w| !can_contract(&w[0], &w[1]))
+    #[test]
+    fn fermion_non_full_contraction() {
+        let p1 = Index::new("p_1").build().unwrap();
+        let p2 = Index::new("p_2").build().unwrap();
+        let p3 = Index::new("p_3").build().unwrap();
+        let p4 = Index::new("p_4").build().unwrap();
+
+        let cp1 = fcrex(p1);
+        let cp2 = fcrex(p2);
+        let ap3 = fannx(p3);
+        let ap4 = fannx(p4);
+        let expr = 1.0 * ap3 * ap4 * cp1 * cp2;
+
+        let wt = WickTheorem::new(expr)
+            .full_contractions(false)
+            .compute()
+            .to_latex();
+        assert_eq!(
+            wt,
+            "a^{p1p2}_{p4p3} -s^{p3}_{p2}a^{p1}_{p4} + s^{p4}_{p2}a^{p1}_{p3} + s^{p3}_{p1}a^{p2}_{p4} -s^{p3}_{p1}s^{p4}_{p2} -s^{p4}_{p1}a^{p2}_{p3} + s^{p4}_{p1}s^{p3}_{p2}"
+        );
+    }
 }
